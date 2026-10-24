@@ -158,6 +158,119 @@
 
 ---
 
+## Part VIII — Worked example: committing to a polynomial with a Reed–Solomon Merkle tree + FRI
+
+*Every number here was computed, not invented: field $\mathbb{F}_{17}$, SHA-256 truncated to 8 hex characters so the hashes fit on a line. It continues the squaring example: the honest quotient there was $Q(X) = 4X^3 + 15X^2 + 14X + 3$.*
+
+**The goal.** The prover wants to commit to $Q$ and convince the verifier that "the thing I committed to is a polynomial of degree $< 4$" without sending $Q$. Three pieces do it: **Reed–Solomon encoding** (evaluate on a bigger domain), a **Merkle tree** (bind to those evaluations), and **FRI** (prove the evaluations are low degree by folding).
+
+### Step 1 — Reed–Solomon encode: evaluate on a larger domain
+
+- Degree bound $d = 4$. Blowup $K = 2$ → evaluation domain of size $N = 8$, rate $\rho = 4/8 = 1/2$. (Real systems use $K \ge 4$; 2 keeps the tables short.)
+- $\omega = 9$ has order 8 in $\mathbb{F}_{17}$, so the domain is
+
+| index $i$ | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| $x = 9^i$ | 1 | 9 | 13 | 15 | 16 | 8 | 4 | 2 |
+| $Q(x)$ | 2 | 10 | 16 | 3 | 0 | 12 | 11 | 4 |
+
+- This row of 8 values **is the Reed–Solomon codeword**. Only 4 of the values are free; the other 4 are forced by the degree bound. That redundancy is what makes lies detectable.
+- **Note the pairing:** $9^4 = 16 = -1$, so index $i$ and index $i+4$ hold $x$ and $-x$ (e.g. 13 and 4). FRI depends on this.
+- (In a real STARK the domain is a coset $g \cdot \langle\omega\rangle$, because the quotient must be computed off the trace domain. FRI runs identically on a coset, since $x$ and $-x$ still pair up.)
+
+### Step 2 — Merkle-commit to the codeword
+
+Hash each value into a leaf, then hash pairs upward:
+
+```
+level 0 (leaves):  e9af7b7f 67470796 fbc05c36 aa4ca58e 8f714d24 69ba2dc8 ac5cc656 3e44a2d3
+                     Q(1)    Q(9)     Q(13)    Q(15)    Q(16)    Q(8)     Q(4)     Q(2)
+level 1:              cc36b119          cb46c7c6          e5cca044          7c0a2b78
+level 2:                        dcb20c92                            dc7a368a
+root:                                          4a4aa549
+```
+
+- The prover sends **only the root `4a4aa549`**. This is the commitment: 8 bytes standing for 8 field elements, binding by collision resistance.
+- **What the root does *not* say:** anything about degree. A Merkle tree commits to *any* vector; it would hash 8 random numbers just as happily. The degree claim is FRI's job. (Part I: "FRI is the price of a commitment scheme with no math in it.")
+
+### Step 3 — FRI fold #1: halve the degree
+
+- Split $Q$ into even and odd parts: $Q(X) = Q_e(X^2) + X\,Q_o(X^2)$, where $Q_e, Q_o$ have degree $< 2$.
+- Both parts can be recovered **pointwise from a pair** $\{x, -x\}$ without knowing coefficients:
+$$Q_e(x^2) = \frac{Q(x) + Q(-x)}{2}, \qquad Q_o(x^2) = \frac{Q(x) - Q(-x)}{2x}$$
+- Fiat–Shamir challenge: $\alpha_1 = \text{hash}(\text{root}_0) \bmod 17 = 13$.
+- The folded function is $Q_1(Y) = Q_e(Y) + \alpha_1 Q_o(Y)$: **degree $< 2$, on the squared domain $\{1, 13, 16, 4\}$** (size 4). Rate is unchanged at $2/4 = 1/2$.
+
+| $y = x^2$ | 1 | 13 | 16 | 4 |
+|---|---|---|---|---|
+| $Q_1(y)$ | 14 | 2 | 16 | 11 |
+
+- Commit again: Merkle root **`e35f743e`**.
+
+**Check one entry by hand** (index 2, from the pair $x = 13$, $-x = 4$, values 16 and 11):
+- $Q_e = (16 + 11)/2 = 10 \cdot 9 = 5$  (since $2^{-1} = 9$)
+- $Q_o = (16 - 11)/(2 \cdot 13) = 5/9 = 5 \cdot 2 = 10$  (since $9^{-1} = 2$)
+- $Q_1(16) = 5 + 13 \cdot 10 = 135 \equiv 16$ ✓
+
+### Step 4 — FRI fold #2: down to a constant
+
+- $\alpha_2 = \text{hash}(\text{root}_0 \,\|\, \text{root}_1) \bmod 17 = 6$.
+- In domain $\{1, 13, 16, 4\}$, the pairs are $(1, 16)$ and $(13, 4)$, i.e. $y$ and $-y$ again.
+- Fold to the domain $\{1, 16\}$: values **$[9, 9]$**.
+- Degree $< 1$ means **constant**. The final layer is tiny, so the prover sends it **in the clear**. The verifier checks directly that both entries are equal. ✓
+
+**Degree trail:** $< 4 \to < 2 \to < 1$. Domain trail: $8 \to 4 \to 2$. Each fold halves both, and each one is the FFT butterfly run backwards (Part V.5).
+
+### Step 5 — The query phase: check the folds are honest
+
+So far the verifier has three things: two roots and a final constant. The prover could have committed garbage at every layer and invented the constant. The queries tie the layers together.
+
+- Query index from the transcript hash: **$i = 2$**.
+
+**Layer 0.** Open positions 2 and 6 (the pair $x = 13$, $-x = 4$):
+- Value 16 at index 2, with Merkle path `[aa4ca58e, cc36b119, dc7a368a]`
+- Value 11 at index 6, with Merkle path `[3e44a2d3, e5cca044, dcb20c92]`
+- Verifier rehashes each leaf up its path and gets root `4a4aa549` both times ✓ (*the values are the committed ones*)
+- Verifier folds them itself with $\alpha_1 = 13$ → **expects 16** at layer-1 position 2.
+
+**Layer 1.** Open positions 0 and 2 (the pair $y = 1$, $-y = 16$):
+- Values 14 and 16, paths check out to `e35f743e` ✓
+- Position 2 holds **16, matching the expected 16** ✓ (*fold #1 was done honestly at this point*)
+- Fold with $\alpha_2 = 6$: $(14+16)/2 + 6 \cdot (14-16)/2 = 15 + 6 \cdot 16 = 111 \equiv 9$ → **expects 9** in the final layer.
+
+**Final layer.** Is 9 ✓.
+
+One query checks one thread through all layers. A real verifier repeats with ~30–80 independent query indices.
+
+### Step 6 — What a cheater runs into
+
+Suppose the prover commits a corrupted codeword, changing $Q(8)$ from 12 to 13: `[2, 10, 16, 3, 0, 13, 11, 4]`. This is no longer a degree-$<4$ evaluation.
+
+**Fiat–Shamir reacts first.** The root changes (`552ebddb`), so every challenge changes: $\alpha_1 = 6$, $\alpha_2 = 10$. The prover can't pick the corruption after seeing the challenges.
+
+**Option A — fold honestly.** Layer 1 becomes `[7, 2, 14, 5]`, and layer 2 becomes **`[1, 3]`**: *not constant*. The verifier rejects without making a single query. The degree problem rose to the surface.
+
+**Option B — lie in the layers to fake a constant.** The cheater commits layer 1 as the fold of the *nearest true codeword*, `[7, 16, 14, 5]`, which folds to `[1, 1]`. Now everything looks fine except at one point: layer 0's pair (indices 1, 5) folds to **2**, but layer 1 claims **16**.
+- A query catches it only if it lands on index 1 or 5: **2 out of 8 = 1/4 per query.**
+- After $s$ queries, the cheater survives with probability $(3/4)^s$. That's about $2 \times 10^{-4}$ at 30 queries.
+
+**Two lessons from Option B:**
+1. This is **why queries exist**: folding forces the lie into the open *somewhere*, and random positions find it.
+2. One corrupted value is the *close-to-a-codeword* case, and it's the hardest one to catch (1/4 here, not the $1 - \rho = 1/2$ from Part IV). A table far from every codeword gets caught much faster. Bounding exactly this behavior is what the **proximity-gap results** are about (Part IV caveat). It's also why real parameters use lower rates and more queries than this toy.
+
+### The whole protocol on one line
+
+> **Commit** (evaluate on a $K\times$ domain, Merkle-root it) → **fold** $\log_2 d$ times with Fiat–Shamir $\alpha$'s, committing each layer → **send the final constant** → **open $s$ random threads**, each checking Merkle paths and one fold equation per layer.
+
+Proof size is $O(s \cdot \log^2 N)$ hashes: $s$ queries × $\log N$ layers × a $\log N$-length Merkle path. That's why STARK proofs are tens to hundreds of KB, compared with a few hundred bytes for KZG-based SNARKs.
+
+**What this example left out:**
+- **Evaluating $Q$ at a point the verifier chooses** ("opening" in the polynomial-commitment sense). That's done by running FRI on $\frac{Q(X) - v}{X - z}$ (Fact 2 again), which is the **DEEP** technique listed under threads.
+- **Batching:** many committed polynomials get combined by a random linear combination and folded together, not proven one at a time.
+- **Folding factors larger than 2** (4, 8, 16) and stopping at a small polynomial instead of a constant, which shortens proofs.
+
+---
+
 ## Threads not yet covered
 
 - **Fact 3:** division with remainder in $\mathbb{F}_p[X]$ → gcd, extended Euclid, exact vs. inexact division.
@@ -184,3 +297,7 @@
 8. Rate $\rho=1/8$, 30 queries. Soundness, and what caveat qualifies that number? → IV
 9. Why must a protocol be public-coin to survive Fiat–Shamir? → VI
 10. What is weak Fiat–Shamir, and why does it break soundness rather than completeness? → VII
+11. A Merkle root commits to a vector. What does it *not* tell the verifier, and which step fills that gap? → VIII.2
+12. From $f(x)$ and $f(-x)$ alone, how do you compute the folded value at $x^2$? Why does folding halve the degree? → VIII.3
+13. A cheater corrupts one codeword value and fakes the next layer. Where does the inconsistency show up, and with what probability does one query catch it here? → VIII.6
+14. Why does changing one committed value change every FRI challenge? → VIII.6
